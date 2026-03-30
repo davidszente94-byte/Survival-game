@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Minimal Canvas Game</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            background-color: #111;
+            touch-action: none;
+        }
+        canvas {
+            display: block;
+        }
+    </style>
+</head>
+<body>
+
+<canvas id="gameCanvas"></canvas>
+
+<script>
+    // --- Configuration & State ---
+    const canvas = document.getElementById('gameCanvas');
+    const ctx = canvas.getContext('2d');
+    
+    let lastTime = 0;
+
+    // Assets (optional - shapes work without images)
+    const assets = {
+        player: new Image(),
+        enemy: new Image(),
+        knife: new Image()
+    };
+
+
+
+    let assetsReady = { player: false, enemy: false, knife: false };
+    Object.keys(assets).forEach(key => {
+        assets[key].onload = () => { assetsReady[key] = true; };
+        assets[key].onerror = () => { assetsReady[key] = false; };
+    });
+    
+    const player = { radius: 25, color: '#00ffcc' };
+
+    assets.player.src = "assets/player.png";
+    assets.enemy.src = "assets/enemy.png";
+    assets.knife.src = "assets/knife.png";
+
+    // Game State
+    let score = 0;
+    let gameOver = false;
+    let survivalTime = 0;
+    let knifeCount = 3;
+
+    // World State
+    const world = { x: 0, y: 0 };
+    const speed = 200;
+    const worldObjects = [];
+    const inputSmooth = { x: 0, y: 0 };
+
+    // Enemy State
+    const enemies = [];
+    let spawnTimer = 0;
+    const spawnInterval = 1;
+    const maxEnemies = 20;
+    const enemyBaseSpeed = 80;
+    const enemySize = 30;
+
+    // Knife State
+    const knives = [];
+    let shootTimer = 0;
+    const shootInterval = 1;
+    const knifeSpeed = 300;
+    const knifeSize = 10;
+
+    // Drop State
+    const drops = [];
+    const maxDrops = 20;
+    const dropSize = 12;
+    const dropChance = 0.2;
+
+    // Joystick State
+    const joystick = { x: 0, y: 0, active: false, thumbX: 0, thumbY: 0 };
+    const joyConfig = { radius: 60, thumbRadius: 25, baseX: 0, baseY: 0 };
+    let activeTouchId = null;
+
+    // Init World Objects
+    for (let i = -5; i <= 5; i++) {
+        for (let j = -5; j <= 5; j++) {
+            if (i === 0 && j === 0) continue;
+            worldObjects.push({ x: i * 100, y: j * 100, w: 40, h: 40, color: '#333' });
+        }
+    }
+
+    // --- System: Resize Handling ---
+    function resize() {
+        const dpr = window.devicePixelRatio || 1;
+        const width = window.innerWidth;
+        const height = window.innerHeight;
+        canvas.width = width * dpr;
+        canvas.height = height * dpr;
+        ctx.scale(dpr, dpr);
+        canvas.style.width = width + 'px';
+        canvas.style.height = height + 'px';
+        joyConfig.baseX = 80;
+        joyConfig.baseY = height - 80;
+        joystick.thumbX = joyConfig.baseX;
+        joystick.thumbY = joyConfig.baseY;
+    }
+    window.addEventListener('resize', resize);
+    resize();
+
+    // --- System: Input Handling ---
+    function updateJoystick(tx, ty) {
+        const dx = tx - joyConfig.baseX, dy = ty - joyConfig.baseY;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        const angle = Math.atan2(dy, dx);
+        const clampedDist = Math.min(dist, joyConfig.radius);
+        joystick.x = (clampedDist / joyConfig.radius) * Math.cos(angle);
+        joystick.y = (clampedDist / joyConfig.radius) * Math.sin(angle);
+        joystick.thumbX = joyConfig.baseX + Math.cos(angle) * clampedDist;
+        joystick.thumbY = joyConfig.baseY + Math.sin(angle) * clampedDist;
+    }
+    function resetJoystick() {
+        joystick.active = false; joystick.x = 0; joystick.y = 0;
+        joystick.thumbX = joyConfig.baseX; joystick.thumbY = joyConfig.baseY;
+        activeTouchId = null;
+    }
+    window.addEventListener('touchstart', (e) => {
+        e.preventDefault();
+        if (gameOver) {
+            score = 0; survivalTime = 0; knifeCount = 3;
+            enemies.length = 0; knives.length = 0; drops.length = 0;
+            world.x = 0; world.y = 0; gameOver = false;
+            return;
+        }
+        if (joystick.active) return;
+        const touch = e.changedTouches[0];
+        const dx = touch.clientX - joyConfig.baseX, dy = touch.clientY - joyConfig.baseY;
+        if (Math.sqrt(dx * dx + dy * dy) <= joyConfig.radius) {
+            joystick.active = true; activeTouchId = touch.identifier;
+            updateJoystick(touch.clientX, touch.clientY);
+        }
+    }, { passive: false });
+    window.addEventListener('touchmove', (e) => {
+        e.preventDefault();
+        if (!joystick.active) return;
+        for (let i = 0; i < e.changedTouches.length; i++) {
+            if (e.changedTouches[i].identifier === activeTouchId) {
+                updateJoystick(e.changedTouches[i].clientX, e.changedTouches[i].clientY);
+                break;
+            }
+        }
+    }, { passive: false });
+    window.addEventListener('touchend', (e) => {
+        e.preventDefault();
+        for (let i = 0; i < e.changedTouches.length; i++) {
+            if (e.changedTouches[i].identifier === activeTouchId) { resetJoystick(); break; }
+        }
+    });
+
+    // --- Game Logic ---
+    function update(deltaTime) {
+        if (gameOver) return;
+        const dpr = window.devicePixelRatio || 1;
+        const width = canvas.width / dpr, height = canvas.height / dpr;
+        survivalTime += deltaTime;
+        inputSmooth.x += (joystick.x - inputSmooth.x) * 0.2;
+        inputSmooth.y += (joystick.y - inputSmooth.y) * 0.2;
+        world.x -= inputSmooth.x * speed * deltaTime;
+        world.y -= inputSmooth.y * speed * deltaTime;
+        const pWX = -world.x + width / 2, pWY = -world.y + height / 2;
+
+        // Spawn Enemies
+        spawnTimer += deltaTime;
+        if (spawnTimer >= spawnInterval && enemies.length < maxEnemies) {
+            const side = Math.floor(Math.random() * 4), pad = 50;
+            let sx, sy;
+            if (side === 0) { sx = Math.random() * width; sy = -pad; }
+            else if (side === 1) { sx = Math.random() * width; sy = height + pad; }
+            else if (side === 2) { sx = -pad; sy = Math.random() * height; }
+            else { sx = width + pad; sy = Math.random() * height; }
+            enemies.push({ x: sx - world.x, y: sy - world.y, speed: enemyBaseSpeed + Math.random() * 40, size: enemySize + (Math.random() * 10 - 5), marked: false });
+            spawnTimer = 0;
+        }
+
+        // Update Enemies
+        for (let i = enemies.length - 1; i >= 0; i--) {
+            const e = enemies[i];
+            if (e.marked) { enemies.splice(i, 1); continue; }
+            const dx = pWX - e.x, dy = pWY - e.y, dist = Math.sqrt(dx * dx + dy * dy);
+            if (dist > 0) { e.x += (dx / dist) * e.speed * deltaTime; e.y += (dy / dist) * e.speed * deltaTime; }
+            if (dist < player.radius + e.size / 2) { gameOver = true; }
+            if (dist > width * 2 + height * 2) { enemies.splice(i, 1); }
+        }
+
+        // Spawn Knives
+        shootTimer += deltaTime;
+        if (shootTimer >= shootInterval) {
+            for (let i = 0; i < knifeCount; i++) {
+                const angle = Math.random() * Math.PI * 2;
+                knives.push({ x: pWX, y: pWY, vx: Math.cos(angle) * knifeSpeed, vy: Math.sin(angle) * knifeSpeed, size: knifeSize });
+            }
+            shootTimer = 0;
+        }
+
+        // Update Knives & Collisions
+        for (let i = knives.length - 1; i >= 0; i--) {
+            const k = knives[i];
+            k.x += k.vx * deltaTime; k.y += k.vy * deltaTime;
+            const sx = k.x + world.x, sy = k.y + world.y;
+            let hit = false;
+            for (let j = enemies.length - 1; j >= 0; j--) {
+                const e = enemies[j];
+                if (e.marked) continue;
+                const edx = k.x - e.x, edy = k.y - e.y, edist = Math.sqrt(edx * edx + edy * edy);
+                if (edist < k.size + e.size / 2) {
+                    e.marked = true; score++;
+                    if (Math.random() < dropChance && drops.length < maxDrops) {
+                        drops.push({ x: e.x, y: e.y, size: dropSize });
+                    }
+                    hit = true; break;
+                }
+            }
+            if (hit) { knives.splice(i, 1); continue; }
+            if (sx < -width || sx > width * 2 || sy < -height || sy > height * 2) { knives.splice(i, 1); }
+        }
+
+        // Player-Drop Pickup
+        for (let i = drops.length - 1; i >= 0; i--) {
+            const d = drops[i];
+            const dx = pWX - d.x, dy = pWY - d.y, dist = Math.sqrt(dx * dx + dy * dy);
+            if (dist < player.radius + d.size) {
+                knifeCount++;
+                drops.splice(i, 1);
+            }
+        }
+    }
+
+    // --- Rendering ---
+    function render() {
+        const dpr = window.devicePixelRatio || 1;
+        const width = canvas.width / dpr, height = canvas.height / dpr;
+        ctx.clearRect(0, 0, width, height);
+
+        worldObjects.forEach(obj => { ctx.fillStyle = obj.color; ctx.fillRect(obj.x + world.x, obj.y + world.y, obj.w, obj.h); });
+
+        // Knives
+        knives.forEach(k => {
+            const sx = k.x + world.x, sy = k.y + world.y;
+            if (assetsReady.knife && assets.knife.width > 0) ctx.drawImage(assets.knife, sx - k.size, sy - k.size, k.size * 2, k.size * 2);
+            else { ctx.fillStyle = '#ffffaa'; ctx.fillRect(sx - k.size, sy - k.size, k.size * 2, k.size * 2); }
+        });
+
+        // Enemies
+        enemies.forEach(e => {
+            const sx = e.x + world.x, sy = e.y + world.y;
+            let drawSize = e.size;
+            if (assetsReady.enemy && assets.enemy.width > 0) {
+                if (e.marked) { ctx.globalAlpha = 0.5; drawSize = e.size * 1.2; }
+                ctx.drawImage(assets.enemy, sx - drawSize, sy - drawSize, drawSize * 2, drawSize * 2);
+                ctx.globalAlpha = 1.0;
+            } else { ctx.fillStyle = e.marked ? '#ffffff' : '#ff3333'; if (e.marked) drawSize = e.size * 1.2; ctx.fillRect(sx - drawSize/2, sy - drawSize/2, drawSize, drawSize); }
+        });
+
+        // Drops
+        ctx.fillStyle = '#00ff88';
+        drops.forEach(d => {
+            const sx = d.x + world.x, sy = d.y + world.y;
+            ctx.beginPath(); ctx.arc(sx, sy, d.size, 0, Math.PI * 2); ctx.fill();
+        });
+
+        // Player
+        const px = width / 2, py = height / 2;
+        if (assetsReady.player && assets.player.width > 0) {
+            ctx.drawImage(assets.player, px - player.radius, py - player.radius, player.radius * 2, player.radius * 2);
+            ctx.lineWidth = 3; ctx.strokeStyle = '#ffffff'; ctx.stroke();
+        } else { ctx.fillStyle = player.color; ctx.beginPath(); ctx.arc(px, py, player.radius, 0, Math.PI * 2); ctx.fill(); ctx.lineWidth = 3; ctx.strokeStyle = '#ffffff'; ctx.stroke(); }
+
+        // Joystick
+        ctx.fillStyle = 'rgba(255,255,255,0.1)'; ctx.beginPath(); ctx.arc(joyConfig.baseX, joyConfig.baseY, joyConfig.radius, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = 'rgba(255,255,255,0.5)'; ctx.beginPath(); ctx.arc(joystick.thumbX, joystick.thumbY, joyConfig.thumbRadius, 0, Math.PI * 2); ctx.fill();
+
+        // UI
+        ctx.fillStyle = '#ffffff'; ctx.font = '30px Arial'; ctx.textAlign = 'left';
+        ctx.fillText('Time: ' + Math.floor(survivalTime), 30, 50);
+        ctx.fillText('Knives: ' + knifeCount, 30, 90);
+        ctx.textAlign = 'right'; ctx.fillText('Score: ' + score, width - 30, 50);
+
+        // Game Over
+        if (gameOver) {
+            ctx.fillStyle = 'rgba(0,0,0,0.7)'; ctx.fillRect(0, 0, width, height);
+            ctx.fillStyle = '#ffffff'; ctx.font = '60px Arial'; ctx.textAlign = 'center';
+            ctx.fillText('GAME OVER', width / 2, height / 2 - 30);
+            ctx.font = '30px Arial'; ctx.fillText('Tap to restart', width / 2, height / 2 + 40);
+        }
+    }
+
+    // --- Game Loop ---
+    function gameLoop(timestamp) {
+        const deltaTime = (timestamp - lastTime) / 1000;
+        lastTime = timestamp;
+        update(deltaTime);
+        render();
+        requestAnimationFrame(gameLoop);
+    }
+    requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>
