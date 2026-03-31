@@ -25,7 +25,7 @@
     // --- Configuration & State ---
     const canvas = document.getElementById('gameCanvas');
     const ctx = canvas.getContext('2d');
-    
+
     let lastTime = 0;
 
     // Assets (optional - shapes work without images)
@@ -33,21 +33,23 @@
         player: new Image(),
         enemy: new Image(),
         knife: new Image(),
-        upgrade: new Image()
+        upgrade: new Image(),
+        firetrail: new Image()
     };
 
-    let assetsReady = { player: false, enemy: false, knife: false, upgrade: false };
+    let assetsReady = { player: false, enemy: false, knife: false, upgrade: false, firetrail: false };
     Object.keys(assets).forEach(key => {
         assets[key].onload = () => { assetsReady[key] = true; };
         assets[key].onerror = () => { assetsReady[key] = false; };
     });
-    
+
     const player = { radius: 25, color: '#00ffcc' };
 
     assets.player.src = "assets/player.png";
     assets.enemy.src = "assets/enemy.png";
     assets.knife.src = "assets/knife.png";
     assets.upgrade.src = "assets/upgrade.png";
+    assets.firetrail.src = "assets/firetrail.png";
 
     // Game State
     let score = 0;
@@ -76,6 +78,7 @@
     const shootInterval = 1;
     const knifeSpeed = 300;
     const knifeSize = 10;
+    const pendingKnives = [];
 
     // Drop State
     const drops = [];
@@ -86,7 +89,14 @@
     // Weapon System
     const weaponPool = ["firewalk", "boomerang", "aura"];
     const unlockedWeapons = [];
-    let availableWeapons = [];
+
+    // FireWalk Weapon State
+    const fireWalkTrail = [];
+    const fireWalkDuration = 4;         // seconds
+    const fireWalkWidth = 35;           // trail width (configurable)
+    const fireWalkSpawnInterval = 0.04; // delay between segments
+    const fireWalkDPS = 60;             // damage per second
+    let fireWalkTimer = 0;
 
     // Joystick State
     const joystick = { x: 0, y: 0, active: false, thumbX: 0, thumbY: 0 };
@@ -216,17 +226,74 @@
 
         inputSmooth.x += (inputX - inputSmooth.x) * 0.2;
         inputSmooth.y += (inputY - inputSmooth.y) * 0.2;
-        
+
         // update last direction when moving
         const inputLen = Math.sqrt(inputSmooth.x * inputSmooth.x + inputSmooth.y * inputSmooth.y);
         if (inputLen > 0.01) {
             lastDir.x = inputSmooth.x / inputLen;
             lastDir.y = inputSmooth.y / inputLen;
         }
-        
+
         world.x -= inputSmooth.x * speed * deltaTime;
         world.y -= inputSmooth.y * speed * deltaTime;
         const pWX = -world.x + width / 2, pWY = -world.y + height / 2;
+
+        // FireWalk: Spawn trail segments
+        const hasFireWalk = unlockedWeapons.includes("firewalk");
+        if (hasFireWalk && inputLen > 0.01) {
+            fireWalkTimer += deltaTime;
+            if (fireWalkTimer >= fireWalkSpawnInterval) {
+                fireWalkTrail.push({
+                    x: pWX,
+                    y: pWY,
+                    remaining: fireWalkDuration
+                });
+                fireWalkTimer = 0;
+            }
+        }
+
+        // FireWalk: Update trail segments
+        for (let i = fireWalkTrail.length - 1; i >= 0; i--) {
+            const seg = fireWalkTrail[i];
+            seg.remaining -= deltaTime;
+            if (seg.remaining <= 0) {
+                fireWalkTrail.splice(i, 1);
+            }
+        }
+
+        // FireWalk: Damage enemies on trail
+        if (hasFireWalk) {
+            for (let i = 0; i < fireWalkTrail.length; i++) {
+                const seg = fireWalkTrail[i];
+                for (let j = 0; j < enemies.length; j++) {
+                    const e = enemies[j];
+                    if (e.marked) continue;
+                    const dx = seg.x - e.x;
+                    const dy = seg.y - e.y;
+                    const dist = Math.sqrt(dx * dx + dy * dy);
+                    if (dist < fireWalkWidth + e.size / 2) {
+                        if (!e.hp) e.hp = 3;
+                        e.hp -= fireWalkDPS * deltaTime;
+                        if (e.hp <= 0) {
+                            e.marked = true;
+                            score++;
+                            if (Math.random() < dropChance && drops.length < maxDrops) {
+                                if (Math.random() < 0.4) {
+                                    const locked = weaponPool.filter(w => !unlockedWeapons.includes(w));
+                                    if (locked.length > 0) {
+                                        drops.push({ x: e.x, y: e.y, size: dropSize, type: "weapon", weaponName: locked[Math.floor(Math.random() * locked.length)] });
+                                    } else {
+                                        drops.push({ x: e.x, y: e.y, size: dropSize, type: "knife" });
+                                    }
+                                } else {
+                                    drops.push({ x: e.x, y: e.y, size: dropSize, type: "knife" });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         // Spawn Enemies
         spawnTimer += deltaTime;
@@ -267,18 +334,55 @@
                 dirY = lastDir.y;
             }
 
-            // spawn ALL knives
-            for (let i = 0; i < knifeCount; i++) {
-                knives.push({
-                    x: pWX,
-                    y: pWY,
-                    vx: dirX * knifeSpeed,
-                    vy: dirY * knifeSpeed,
-                    size: knifeSize
-                });
+            const spacingTime = 0.04;
+            const laneSpacing = 12;
+            const maxWidthKnives = 3;
+
+            const perpX = -dirY;
+            const perpY = dirX;
+
+            const widthCount = Math.min(knifeCount, maxWidthKnives);
+            const rows = Math.ceil(knifeCount / maxWidthKnives);
+
+            for (let row = 0; row < rows; row++) {
+                for (let i = 0; i < widthCount; i++) {
+                    const index = row * maxWidthKnives + i;
+                    if (index >= knifeCount) break;
+
+                    const offsetFactor = i - (widthCount - 1) / 2;
+
+                    pendingKnives.push({
+                        delay: row * spacingTime,
+                        x: pWX,
+                        y: pWY,
+                        vx: dirX * knifeSpeed,
+                        vy: dirY * knifeSpeed,
+                        size: knifeSize,
+                        offsetX: perpX * offsetFactor * laneSpacing,
+                        offsetY: perpY * offsetFactor * laneSpacing
+                    });
+                }
             }
 
             shootTimer = 0;
+        }
+
+        // Process pending knives
+        for (let i = pendingKnives.length - 1; i >= 0; i--) {
+            const pk = pendingKnives[i];
+            pk.delay -= deltaTime;
+
+            if (pk.delay <= 0) {
+                knives.push({
+                    x: pk.x + pk.offsetX,
+                    y: pk.y + pk.offsetY,
+                    vx: pk.vx,
+                    vy: pk.vy,
+                    size: pk.size
+                });
+
+                pendingKnives.splice(i, 1);
+            }
         }
 
         // Update Knives & Collisions
@@ -294,16 +398,16 @@
                 if (edist < k.size + e.size / 2) {
                     e.marked = true; score++;
                     if (Math.random() < dropChance && drops.length < maxDrops) {
-                        // decide drop type
-                        let dropType = "knife";
-                        if (Math.random() < 0.3) {
-                            dropType = "weapon";
+                        if (Math.random() < 0.4) {
+                            const locked = weaponPool.filter(w => !unlockedWeapons.includes(w));
+                            if (locked.length > 0) {
+                                drops.push({ x: e.x, y: e.y, size: dropSize, type: "weapon", weaponName: locked[Math.floor(Math.random() * locked.length)] });
+                            } else {
+                                drops.push({ x: e.x, y: e.y, size: dropSize, type: "knife" });
+                            }
+                        } else {
+                            drops.push({ x: e.x, y: e.y, size: dropSize, type: "knife" });
                         }
-                        // fallback if no weapons available
-                        if (availableWeapons.length === 0) {
-                            dropType = "knife";
-                        }
-                        drops.push({ x: e.x, y: e.y, size: dropSize, type: dropType });
                     }
                     hit = true; break;
                 }
@@ -320,15 +424,11 @@
                 if (d.type === "knife") {
                     knifeCount++;
                 }
-                if (d.type === "weapon") {
-                    const newWeapon = getRandomLockedWeapon();
-                    if (newWeapon) {
-                        unlockedWeapons.push(newWeapon);
-                        console.log("Unlocked weapon:", newWeapon);
-                    } else {
-                        // fallback if all weapons unlocked
-                        knifeCount++;
-                    }
+                if (d.type === "weapon" && d.weaponName && !unlockedWeapons.includes(d.weaponName)) {
+                    unlockedWeapons.push(d.weaponName);
+                    console.log("🔥 Collected weapon:", d.weaponName);
+                } else if (d.type === "weapon") {
+                    knifeCount++;
                 }
                 drops.splice(i, 1);
             }
@@ -342,6 +442,21 @@
         ctx.clearRect(0, 0, width, height);
 
         worldObjects.forEach(obj => { ctx.fillStyle = obj.color; ctx.fillRect(obj.x + world.x, obj.y + world.y, obj.w, obj.h); });
+
+        // FireWalk Trail (render BEFORE enemies so they appear above)
+        const hasFireWalk = unlockedWeapons.includes("firewalk");
+        if (hasFireWalk) {
+            for (let i = 0; i < fireWalkTrail.length; i++) {
+                const seg = fireWalkTrail[i];
+                const sx = seg.x + world.x;
+                const sy = seg.y + world.y;
+                const alpha = seg.remaining / fireWalkDuration;
+                ctx.fillStyle = `rgba(255, 100, 0, ${alpha * 0.6})`;
+                ctx.beginPath();
+                ctx.arc(sx, sy, fireWalkWidth, 0, Math.PI * 2);
+                ctx.fill();
+            }
+        }
 
         // Knives
         knives.forEach(k => {
@@ -365,7 +480,15 @@
         drops.forEach(d => {
             const sx = d.x + world.x, sy = d.y + world.y;
 
-            if (assetsReady.upgrade && assets.upgrade.width > 0) {
+            if (d.type === "weapon" && assetsReady.firetrail && assets.firetrail.width > 0) {
+                ctx.drawImage(
+                    assets.firetrail,
+                    sx - d.size,
+                    sy - d.size,
+                    d.size * 2,
+                    d.size * 2
+                );
+            } else if (d.type === "knife" && assetsReady.upgrade && assets.upgrade.width > 0) {
                 ctx.drawImage(
                     assets.upgrade,
                     sx - d.size,
@@ -375,13 +498,22 @@
                 );
             } else {
                 if (d.type === "weapon") {
-                    ctx.fillStyle = '#ffcc00'; // weapon drop color
+                    ctx.fillStyle = '#ff0000'; // 🔴 Bright red for weapon drops
+                    ctx.shadowColor = '#ff4444';
+                    ctx.shadowBlur = 8;         // Glow for visibility
                 } else {
-                    ctx.fillStyle = '#00ff88'; // knife upgrade
+                    ctx.fillStyle = '#00ff88';  // 🟢 Green for knife upgrades
+                    ctx.shadowBlur = 0;         // Reset shadow
                 }
                 ctx.beginPath();
                 ctx.arc(sx, sy, d.size, 0, Math.PI * 2);
                 ctx.fill();
+                ctx.shadowBlur = 0; // Reset shadow for next draws
+
+                // White border to both for clarity
+                ctx.strokeStyle = '#ffffff';
+                ctx.lineWidth = 2;
+                ctx.stroke();
             }
         });
 
