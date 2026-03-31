@@ -32,12 +32,11 @@
     const assets = {
         player: new Image(),
         enemy: new Image(),
-        knife: new Image()
+        knife: new Image(),
+        upgrade: new Image()
     };
 
-
-
-    let assetsReady = { player: false, enemy: false, knife: false };
+    let assetsReady = { player: false, enemy: false, knife: false, upgrade: false };
     Object.keys(assets).forEach(key => {
         assets[key].onload = () => { assetsReady[key] = true; };
         assets[key].onerror = () => { assetsReady[key] = false; };
@@ -48,18 +47,20 @@
     assets.player.src = "assets/player.png";
     assets.enemy.src = "assets/enemy.png";
     assets.knife.src = "assets/knife.png";
+    assets.upgrade.src = "assets/upgrade.png";
 
     // Game State
     let score = 0;
     let gameOver = false;
     let survivalTime = 0;
-    let knifeCount = 3;
+    let knifeCount = 1;
 
     // World State
     const world = { x: 0, y: 0 };
     const speed = 200;
     const worldObjects = [];
     const inputSmooth = { x: 0, y: 0 };
+    let lastDir = { x: 1, y: 0 };
 
     // Enemy State
     const enemies = [];
@@ -82,10 +83,18 @@
     const dropSize = 12;
     const dropChance = 0.2;
 
+    // Weapon System
+    const weaponPool = ["firewalk", "boomerang", "aura"];
+    const unlockedWeapons = [];
+    let availableWeapons = [];
+
     // Joystick State
     const joystick = { x: 0, y: 0, active: false, thumbX: 0, thumbY: 0 };
     const joyConfig = { radius: 60, thumbRadius: 25, baseX: 0, baseY: 0 };
     let activeTouchId = null;
+
+    // WASD State
+    const keys = { w: false, a: false, s: false, d: false };
 
     // Init World Objects
     for (let i = -5; i <= 5; i++) {
@@ -162,14 +171,59 @@
         }
     });
 
+    // WASD Input Handling
+    window.addEventListener('keydown', (e) => {
+        if (e.key === 'w' || e.key === 'W') keys.w = true;
+        if (e.key === 'a' || e.key === 'A') keys.a = true;
+        if (e.key === 's' || e.key === 'S') keys.s = true;
+        if (e.key === 'd' || e.key === 'D') keys.d = true;
+    });
+    window.addEventListener('keyup', (e) => {
+        if (e.key === 'w' || e.key === 'W') keys.w = false;
+        if (e.key === 'a' || e.key === 'A') keys.a = false;
+        if (e.key === 's' || e.key === 'S') keys.s = false;
+        if (e.key === 'd' || e.key === 'D') keys.d = false;
+    });
+
+    // Helper: Get random locked weapon
+    function getRandomLockedWeapon() {
+        const locked = weaponPool.filter(w => !unlockedWeapons.includes(w));
+        if (locked.length === 0) return null;
+        return locked[Math.floor(Math.random() * locked.length)];
+    }
+
     // --- Game Logic ---
     function update(deltaTime) {
         if (gameOver) return;
         const dpr = window.devicePixelRatio || 1;
         const width = canvas.width / dpr, height = canvas.height / dpr;
         survivalTime += deltaTime;
-        inputSmooth.x += (joystick.x - inputSmooth.x) * 0.2;
-        inputSmooth.y += (joystick.y - inputSmooth.y) * 0.2;
+
+        // Combine WASD and Joystick input
+        let inputX = joystick.x;
+        let inputY = joystick.y;
+        if (keys.w) inputY -= 1;
+        if (keys.s) inputY += 1;
+        if (keys.a) inputX -= 1;
+        if (keys.d) inputX += 1;
+
+        // Normalize if using WASD
+        const inputMag = Math.sqrt(inputX * inputX + inputY * inputY);
+        if (inputMag > 1 && (keys.w || keys.a || keys.s || keys.d)) {
+            inputX /= inputMag;
+            inputY /= inputMag;
+        }
+
+        inputSmooth.x += (inputX - inputSmooth.x) * 0.2;
+        inputSmooth.y += (inputY - inputSmooth.y) * 0.2;
+        
+        // update last direction when moving
+        const inputLen = Math.sqrt(inputSmooth.x * inputSmooth.x + inputSmooth.y * inputSmooth.y);
+        if (inputLen > 0.01) {
+            lastDir.x = inputSmooth.x / inputLen;
+            lastDir.y = inputSmooth.y / inputLen;
+        }
+        
         world.x -= inputSmooth.x * speed * deltaTime;
         world.y -= inputSmooth.y * speed * deltaTime;
         const pWX = -world.x + width / 2, pWY = -world.y + height / 2;
@@ -200,10 +254,30 @@
         // Spawn Knives
         shootTimer += deltaTime;
         if (shootTimer >= shootInterval) {
-            for (let i = 0; i < knifeCount; i++) {
-                const angle = Math.random() * Math.PI * 2;
-                knives.push({ x: pWX, y: pWY, vx: Math.cos(angle) * knifeSpeed, vy: Math.sin(angle) * knifeSpeed, size: knifeSize });
+            let dirX = inputSmooth.x;
+            let dirY = inputSmooth.y;
+
+            const length = Math.sqrt(dirX * dirX + dirY * dirY);
+
+            if (length > 0.01) {
+                dirX /= length;
+                dirY /= length;
+            } else {
+                dirX = lastDir.x;
+                dirY = lastDir.y;
             }
+
+            // spawn ALL knives
+            for (let i = 0; i < knifeCount; i++) {
+                knives.push({
+                    x: pWX,
+                    y: pWY,
+                    vx: dirX * knifeSpeed,
+                    vy: dirY * knifeSpeed,
+                    size: knifeSize
+                });
+            }
+
             shootTimer = 0;
         }
 
@@ -220,7 +294,16 @@
                 if (edist < k.size + e.size / 2) {
                     e.marked = true; score++;
                     if (Math.random() < dropChance && drops.length < maxDrops) {
-                        drops.push({ x: e.x, y: e.y, size: dropSize });
+                        // decide drop type
+                        let dropType = "knife";
+                        if (Math.random() < 0.3) {
+                            dropType = "weapon";
+                        }
+                        // fallback if no weapons available
+                        if (availableWeapons.length === 0) {
+                            dropType = "knife";
+                        }
+                        drops.push({ x: e.x, y: e.y, size: dropSize, type: dropType });
                     }
                     hit = true; break;
                 }
@@ -234,7 +317,19 @@
             const d = drops[i];
             const dx = pWX - d.x, dy = pWY - d.y, dist = Math.sqrt(dx * dx + dy * dy);
             if (dist < player.radius + d.size) {
-                knifeCount++;
+                if (d.type === "knife") {
+                    knifeCount++;
+                }
+                if (d.type === "weapon") {
+                    const newWeapon = getRandomLockedWeapon();
+                    if (newWeapon) {
+                        unlockedWeapons.push(newWeapon);
+                        console.log("Unlocked weapon:", newWeapon);
+                    } else {
+                        // fallback if all weapons unlocked
+                        knifeCount++;
+                    }
+                }
                 drops.splice(i, 1);
             }
         }
@@ -267,10 +362,27 @@
         });
 
         // Drops
-        ctx.fillStyle = '#00ff88';
         drops.forEach(d => {
             const sx = d.x + world.x, sy = d.y + world.y;
-            ctx.beginPath(); ctx.arc(sx, sy, d.size, 0, Math.PI * 2); ctx.fill();
+
+            if (assetsReady.upgrade && assets.upgrade.width > 0) {
+                ctx.drawImage(
+                    assets.upgrade,
+                    sx - d.size,
+                    sy - d.size,
+                    d.size * 2,
+                    d.size * 2
+                );
+            } else {
+                if (d.type === "weapon") {
+                    ctx.fillStyle = '#ffcc00'; // weapon drop color
+                } else {
+                    ctx.fillStyle = '#00ff88'; // knife upgrade
+                }
+                ctx.beginPath();
+                ctx.arc(sx, sy, d.size, 0, Math.PI * 2);
+                ctx.fill();
+            }
         });
 
         // Player
